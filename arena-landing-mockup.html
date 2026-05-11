@@ -669,6 +669,15 @@
     const RIM_POWER        = 1.6;
     const RIM_BOOST        = 0.55;
 
+    /* Mouse interaction — dots near the cursor lift outward from the sphere
+       and brighten/grow within a falloff radius. As the orb rotates under a
+       stationary cursor, dots animate through the zone for free. */
+    const MOUSE_RADIUS        = 0.55; // world units (sphere radius is 1.45)
+    const MOUSE_LIFT          = 0.10; // outward push along surface normal
+    const MOUSE_SIZE_BOOST    = 0.70; // additive size multiplier inside zone
+    const MOUSE_BRIGHT_BOOST  = 0.30; // additive brightness inside zone
+    const MOUSE_STRENGTH_LERP = 0.18; // per-frame ease toward target strength
+
     /* Marker locations: [lat, lon, label]. Tooltip shows label on hover. */
     const MARKER_LOCATIONS = [
       [26.93,  -80.09, 'Jupiter, FL'],
@@ -738,6 +747,14 @@
         uRimPower:        { value: RIM_POWER },
         uRimBoost:        { value: RIM_BOOST },
         uBreath:          { value: 1.0 },
+        /* Mouse interaction. uMouseTarget is the world-space point on the
+           sphere where the cursor ray hits; sits far away when no hit. */
+        uMouseTarget:     { value: new THREE.Vector3(100, 100, 100) },
+        uMouseStrength:   { value: 0.0 },
+        uMouseRadius:     { value: MOUSE_RADIUS },
+        uMouseLift:       { value: MOUSE_LIFT },
+        uMouseSizeBoost:  { value: MOUSE_SIZE_BOOST },
+        uMouseBrightBoost:{ value: MOUSE_BRIGHT_BOOST },
         uColor:           { value: new THREE.Color(0xF5EFE0) },
       },
       vertexShader: /* glsl */ `
@@ -752,6 +769,13 @@
         uniform float uRimPower;
         uniform float uRimBoost;
         uniform float uBreath;
+
+        uniform vec3  uMouseTarget;
+        uniform float uMouseStrength;
+        uniform float uMouseRadius;
+        uniform float uMouseLift;
+        uniform float uMouseSizeBoost;
+        uniform float uMouseBrightBoost;
 
         void main() {
           vec4 worldPos4 = modelMatrix * vec4(position, 1.0);
@@ -769,13 +793,24 @@
           /* Fresnel rim — peaks at silhouette (ndotv≈0), zero when facing camera */
           float rim = pow(1.0 - clamp(ndotv, 0.0, 1.0), uRimPower);
 
-          float baseBrightness = mix(uOceanBrightness, uLandBrightness, aLand);
-          vBrightness = (baseBrightness + rim * uRimBoost) * front * uBreath;
+          /* Mouse interaction falloff. Zero outside uMouseRadius, 1 at the
+             cursor's contact point on the sphere. Multiplied by uMouseStrength
+             so the effect smoothly fades in/out as the cursor enters/leaves. */
+          float mouseDist = distance(worldPos, uMouseTarget);
+          float mouseFalloff = smoothstep(uMouseRadius, 0.0, mouseDist) * uMouseStrength;
 
-          vec4 mvPosition = viewMatrix * worldPos4;
+          /* Lift the dot outward along its surface normal. Have to recompute
+             the world position so the projected gl_Position reflects the lift. */
+          worldPos += worldN * mouseFalloff * uMouseLift;
+
+          float baseBrightness = mix(uOceanBrightness, uLandBrightness, aLand);
+          vBrightness = (baseBrightness + rim * uRimBoost + mouseFalloff * uMouseBrightBoost) * front * uBreath;
+
+          vec4 mvPosition = viewMatrix * vec4(worldPos, 1.0);
           gl_Position = projectionMatrix * mvPosition;
-          /* Land dots are bigger than ocean dots so coastlines read sharper. */
-          float sizeMul = 1.0 + uLandSizeBoost * aLand;
+          /* Land dots are bigger than ocean dots so coastlines read sharper;
+             mouse-affected dots get an additional size boost. */
+          float sizeMul = 1.0 + uLandSizeBoost * aLand + mouseFalloff * uMouseSizeBoost;
           gl_PointSize = uPointSize * sizeMul * uPixelRatio * (300.0 / -mvPosition.z);
         }
       `,
@@ -864,11 +899,13 @@
       try { canvas.releasePointerCapture(e.pointerId); } catch (_) {}
     });
 
-    /* ---------- Marker hover tooltips ----------
-       Raycast against the markerPoints buffer. Filter out hits on the far side
-       of the orb (markers behind the globe shouldn't trigger tooltips). The
-       marker buffer is in the same order as MARKER_LOCATIONS so hit.index maps
-       directly back to the label. */
+    /* ---------- Marker hover tooltips + cursor displacement ----------
+       One raycaster, two jobs per pointermove:
+         1. Intersect markerPoints → drive the tooltip.
+         2. Intersect an invisible sphere at the orb's surface → set the
+            uMouseTarget uniform so the shader can lift nearby dots.
+       Marker buffer is in the same order as MARKER_LOCATIONS, so hit.index
+       maps directly back to the label. */
     const tooltipEl  = document.querySelector('.orb-tooltip');
     const raycaster  = new THREE.Raycaster();
     raycaster.params.Points.threshold = 0.08;
@@ -877,24 +914,39 @@
     const tmpToCam   = new THREE.Vector3();
     const tmpNormal  = new THREE.Vector3();
 
+    /* Invisible sphere for the cursor-projection effect. World-space sphere at
+       the orb's location (orbGroup.position is origin) with the orb's radius. */
+    const interactionSphere   = new THREE.Sphere(new THREE.Vector3(0, 0, 0), RADIUS);
+    const mouseTargetWorld    = new THREE.Vector3();
+    let   mouseOnOrb          = false;
+
     function updateHover(clientX, clientY) {
       if (isDragging || !tooltipEl) {
         if (tooltipEl) tooltipEl.classList.remove('is-visible');
+        mouseOnOrb = false;
         return;
       }
       const rect = canvas.getBoundingClientRect();
       mouseNDC.x =  ((clientX - rect.left) / rect.width)  * 2 - 1;
       mouseNDC.y = -((clientY - rect.top)  / rect.height) * 2 + 1;
       raycaster.setFromCamera(mouseNDC, camera);
-      const hits = raycaster.intersectObject(markerPoints);
 
+      /* Cursor-projection: pick the near intersection with the orb surface.
+         If the ray doesn't hit the sphere, the effect fades out. */
+      const sphereHit = raycaster.ray.intersectSphere(interactionSphere, mouseTargetWorld);
+      mouseOnOrb = !!sphereHit;
+      if (sphereHit) {
+        dotsMat.uniforms.uMouseTarget.value.copy(mouseTargetWorld);
+      }
+
+      /* Marker tooltip: same raycaster, against the marker buffer. */
+      const hits = raycaster.intersectObject(markerPoints);
       for (const hit of hits) {
         const idx = hit.index;
         tmpWorld.fromBufferAttribute(markerGeom.attributes.position, idx);
         markerPoints.localToWorld(tmpWorld);
         tmpNormal.copy(tmpWorld).normalize();
         tmpToCam.subVectors(camera.position, tmpWorld).normalize();
-        // Only show tooltip when the marker is on the near hemisphere.
         if (tmpNormal.dot(tmpToCam) > 0.1) {
           tooltipEl.textContent = MARKER_LOCATIONS[idx][2] || '';
           tooltipEl.style.left = `${clientX}px`;
@@ -909,6 +961,7 @@
     canvas.addEventListener('pointermove', (e) => updateHover(e.clientX, e.clientY));
     canvas.addEventListener('pointerleave', () => {
       if (tooltipEl) tooltipEl.classList.remove('is-visible');
+      mouseOnOrb = false;
     });
 
     /* ---------- animation loop ---------- */
@@ -923,6 +976,15 @@
       }
       const t = performance.now() / 1000;
       dotsMat.uniforms.uBreath.value = 1.0 + Math.sin(t * breathOmega) * BREATH_AMPLITUDE;
+
+      /* Smoothly ease mouse-effect strength toward target. Without this lerp,
+         the lift effect would snap to full on pointer-enter and snap back on
+         pointer-leave — feels mechanical. */
+      const targetStrength = (mouseOnOrb && !isDragging) ? 1.0 : 0.0;
+      const currentStrength = dotsMat.uniforms.uMouseStrength.value;
+      dotsMat.uniforms.uMouseStrength.value =
+        currentStrength + (targetStrength - currentStrength) * MOUSE_STRENGTH_LERP;
+
       renderer.render(scene, camera);
     }
 

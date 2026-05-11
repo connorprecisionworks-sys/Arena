@@ -669,14 +669,12 @@
     const RIM_POWER        = 1.6;
     const RIM_BOOST        = 0.55;
 
-    /* Mouse interaction — dots near the cursor lift outward from the sphere
-       and brighten/grow within a falloff radius. As the orb rotates under a
-       stationary cursor, dots animate through the zone for free. */
-    const MOUSE_RADIUS        = 0.55; // world units (sphere radius is 1.45)
-    const MOUSE_LIFT          = 0.10; // outward push along surface normal
-    const MOUSE_SIZE_BOOST    = 0.70; // additive size multiplier inside zone
-    const MOUSE_BRIGHT_BOOST  = 0.30; // additive brightness inside zone
-    const MOUSE_STRENGTH_LERP = 0.18; // per-frame ease toward target strength
+    /* Marker hover animation — when the cursor is over a marker, that
+       specific marker grows and brightens. State is per-marker (one progress
+       value per pin) animated via a per-vertex BufferAttribute. */
+    const MARKER_HOVER_SIZE_BOOST  = 0.9;  // 1 + this = max scale (≈1.9×)
+    const MARKER_HOVER_BRIGHT_BOOST = 0.5; // 1 + this = max brightness mult
+    const MARKER_HOVER_LERP        = 0.20; // per-frame ease toward target
 
     /* Marker locations: [lat, lon, label]. Tooltip shows label on hover. */
     const MARKER_LOCATIONS = [
@@ -747,14 +745,6 @@
         uRimPower:        { value: RIM_POWER },
         uRimBoost:        { value: RIM_BOOST },
         uBreath:          { value: 1.0 },
-        /* Mouse interaction. uMouseTarget is the world-space point on the
-           sphere where the cursor ray hits; sits far away when no hit. */
-        uMouseTarget:     { value: new THREE.Vector3(100, 100, 100) },
-        uMouseStrength:   { value: 0.0 },
-        uMouseRadius:     { value: MOUSE_RADIUS },
-        uMouseLift:       { value: MOUSE_LIFT },
-        uMouseSizeBoost:  { value: MOUSE_SIZE_BOOST },
-        uMouseBrightBoost:{ value: MOUSE_BRIGHT_BOOST },
         uColor:           { value: new THREE.Color(0xF5EFE0) },
       },
       vertexShader: /* glsl */ `
@@ -769,13 +759,6 @@
         uniform float uRimPower;
         uniform float uRimBoost;
         uniform float uBreath;
-
-        uniform vec3  uMouseTarget;
-        uniform float uMouseStrength;
-        uniform float uMouseRadius;
-        uniform float uMouseLift;
-        uniform float uMouseSizeBoost;
-        uniform float uMouseBrightBoost;
 
         void main() {
           vec4 worldPos4 = modelMatrix * vec4(position, 1.0);
@@ -793,24 +776,13 @@
           /* Fresnel rim — peaks at silhouette (ndotv≈0), zero when facing camera */
           float rim = pow(1.0 - clamp(ndotv, 0.0, 1.0), uRimPower);
 
-          /* Mouse interaction falloff. Zero outside uMouseRadius, 1 at the
-             cursor's contact point on the sphere. Multiplied by uMouseStrength
-             so the effect smoothly fades in/out as the cursor enters/leaves. */
-          float mouseDist = distance(worldPos, uMouseTarget);
-          float mouseFalloff = smoothstep(uMouseRadius, 0.0, mouseDist) * uMouseStrength;
-
-          /* Lift the dot outward along its surface normal. Have to recompute
-             the world position so the projected gl_Position reflects the lift. */
-          worldPos += worldN * mouseFalloff * uMouseLift;
-
           float baseBrightness = mix(uOceanBrightness, uLandBrightness, aLand);
-          vBrightness = (baseBrightness + rim * uRimBoost + mouseFalloff * uMouseBrightBoost) * front * uBreath;
+          vBrightness = (baseBrightness + rim * uRimBoost) * front * uBreath;
 
-          vec4 mvPosition = viewMatrix * vec4(worldPos, 1.0);
+          vec4 mvPosition = viewMatrix * worldPos4;
           gl_Position = projectionMatrix * mvPosition;
-          /* Land dots are bigger than ocean dots so coastlines read sharper;
-             mouse-affected dots get an additional size boost. */
-          float sizeMul = 1.0 + uLandSizeBoost * aLand + mouseFalloff * uMouseSizeBoost;
+          /* Land dots are bigger than ocean dots so coastlines read sharper. */
+          float sizeMul = 1.0 + uLandSizeBoost * aLand;
           gl_PointSize = uPointSize * sizeMul * uPixelRatio * (300.0 / -mvPosition.z);
         }
       `,
@@ -848,16 +820,54 @@
       markerPositions[3*m+1] = md.y * MARKER_R;
       markerPositions[3*m+2] = md.z * MARKER_R;
     }
+    /* Per-marker hover progress (one float per pin, 0 = idle, 1 = hovered).
+       Lerped in tick() and written back to the buffer attribute, which the
+       marker shader reads to scale size and brightness on hover. */
+    const markerHoverProgress = new Float32Array(NM); // zeros by default
     const markerGeom = new THREE.BufferGeometry();
     markerGeom.setAttribute('position', new THREE.BufferAttribute(markerPositions, 3));
-    const markerMat = new THREE.PointsMaterial({
-      map: makeCircleTexture(),
-      size: MARKER_SIZE,
-      color: 0xFFD040,
+    markerGeom.setAttribute('aHover', new THREE.BufferAttribute(markerHoverProgress, 1));
+
+    const markerMat = new THREE.ShaderMaterial({
+      uniforms: {
+        uMap:              { value: makeCircleTexture() },
+        uSize:             { value: MARKER_SIZE },
+        uPixelRatio:       { value: Math.min(window.devicePixelRatio, 2) },
+        uHoverSizeBoost:   { value: MARKER_HOVER_SIZE_BOOST },
+        uHoverBrightBoost: { value: MARKER_HOVER_BRIGHT_BOOST },
+        uColor:            { value: new THREE.Color(0xFFD040) },
+      },
+      vertexShader: /* glsl */ `
+        attribute float aHover;
+        varying float vHover;
+
+        uniform float uSize;
+        uniform float uPixelRatio;
+        uniform float uHoverSizeBoost;
+
+        void main() {
+          vHover = aHover;
+          vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+          gl_Position = projectionMatrix * mvPosition;
+          float sizeMul = 1.0 + aHover * uHoverSizeBoost;
+          gl_PointSize = uSize * sizeMul * uPixelRatio * (300.0 / -mvPosition.z);
+        }
+      `,
+      fragmentShader: /* glsl */ `
+        varying float vHover;
+        uniform sampler2D uMap;
+        uniform vec3 uColor;
+        uniform float uHoverBrightBoost;
+
+        void main() {
+          vec4 tex = texture2D(uMap, gl_PointCoord);
+          if (tex.a < 0.05) discard;
+          float brightness = 1.0 + vHover * uHoverBrightBoost;
+          gl_FragColor = vec4(uColor * brightness, tex.a);
+        }
+      `,
       transparent: true,
-      opacity: 1.0,
       depthWrite: false,
-      sizeAttenuation: true,
     });
     const markerPoints = new THREE.Points(markerGeom, markerMat);
 
@@ -914,33 +924,22 @@
     const tmpToCam   = new THREE.Vector3();
     const tmpNormal  = new THREE.Vector3();
 
-    /* Invisible sphere for the cursor-projection effect. World-space sphere at
-       the orb's location (orbGroup.position is origin) with the orb's radius. */
-    const interactionSphere   = new THREE.Sphere(new THREE.Vector3(0, 0, 0), RADIUS);
-    const mouseTargetWorld    = new THREE.Vector3();
-    let   mouseOnOrb          = false;
+    /* Index of the currently hovered marker (-1 = none). Drives the per-marker
+       size/brightness animation; the actual lerp happens in tick(). */
+    let hoveredMarkerIdx = -1;
 
     function updateHover(clientX, clientY) {
       if (isDragging || !tooltipEl) {
         if (tooltipEl) tooltipEl.classList.remove('is-visible');
-        mouseOnOrb = false;
+        hoveredMarkerIdx = -1;
         return;
       }
       const rect = canvas.getBoundingClientRect();
       mouseNDC.x =  ((clientX - rect.left) / rect.width)  * 2 - 1;
       mouseNDC.y = -((clientY - rect.top)  / rect.height) * 2 + 1;
       raycaster.setFromCamera(mouseNDC, camera);
-
-      /* Cursor-projection: pick the near intersection with the orb surface.
-         If the ray doesn't hit the sphere, the effect fades out. */
-      const sphereHit = raycaster.ray.intersectSphere(interactionSphere, mouseTargetWorld);
-      mouseOnOrb = !!sphereHit;
-      if (sphereHit) {
-        dotsMat.uniforms.uMouseTarget.value.copy(mouseTargetWorld);
-      }
-
-      /* Marker tooltip: same raycaster, against the marker buffer. */
       const hits = raycaster.intersectObject(markerPoints);
+
       for (const hit of hits) {
         const idx = hit.index;
         tmpWorld.fromBufferAttribute(markerGeom.attributes.position, idx);
@@ -948,6 +947,7 @@
         tmpNormal.copy(tmpWorld).normalize();
         tmpToCam.subVectors(camera.position, tmpWorld).normalize();
         if (tmpNormal.dot(tmpToCam) > 0.1) {
+          hoveredMarkerIdx = idx;
           tooltipEl.textContent = MARKER_LOCATIONS[idx][2] || '';
           tooltipEl.style.left = `${clientX}px`;
           tooltipEl.style.top  = `${clientY}px`;
@@ -955,13 +955,14 @@
           return;
         }
       }
+      hoveredMarkerIdx = -1;
       tooltipEl.classList.remove('is-visible');
     }
 
     canvas.addEventListener('pointermove', (e) => updateHover(e.clientX, e.clientY));
     canvas.addEventListener('pointerleave', () => {
       if (tooltipEl) tooltipEl.classList.remove('is-visible');
-      mouseOnOrb = false;
+      hoveredMarkerIdx = -1;
     });
 
     /* ---------- animation loop ---------- */
@@ -977,13 +978,22 @@
       const t = performance.now() / 1000;
       dotsMat.uniforms.uBreath.value = 1.0 + Math.sin(t * breathOmega) * BREATH_AMPLITUDE;
 
-      /* Smoothly ease mouse-effect strength toward target. Without this lerp,
-         the lift effect would snap to full on pointer-enter and snap back on
-         pointer-leave — feels mechanical. */
-      const targetStrength = (mouseOnOrb && !isDragging) ? 1.0 : 0.0;
-      const currentStrength = dotsMat.uniforms.uMouseStrength.value;
-      dotsMat.uniforms.uMouseStrength.value =
-        currentStrength + (targetStrength - currentStrength) * MOUSE_STRENGTH_LERP;
+      /* Lerp each marker's hover progress toward its target. The hovered
+         marker eases toward 1, all others toward 0 — so animations cleanly
+         cross-fade when the cursor moves between pins. */
+      let hoverDirty = false;
+      for (let i = 0; i < NM; i++) {
+        const target = (i === hoveredMarkerIdx && !isDragging) ? 1.0 : 0.0;
+        const curr = markerHoverProgress[i];
+        const next = curr + (target - curr) * MARKER_HOVER_LERP;
+        if (Math.abs(next - curr) > 0.0001) {
+          markerHoverProgress[i] = next;
+          hoverDirty = true;
+        }
+      }
+      if (hoverDirty) {
+        markerGeom.attributes.aHover.needsUpdate = true;
+      }
 
       renderer.render(scene, camera);
     }

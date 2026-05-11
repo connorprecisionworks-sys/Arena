@@ -41,6 +41,12 @@ const RIM_BOOST = 0.55;
 const BREATH_PERIOD = 7.0; // seconds per cycle
 const BREATH_AMPLITUDE = 0.05; // ±5% brightness
 
+/* Marker hover animation — hovered pin scales and brightens, all others
+   ease back to idle. Driven via a per-vertex BufferAttribute updated in tick(). */
+const MARKER_HOVER_SIZE_BOOST = 0.9;
+const MARKER_HOVER_BRIGHT_BOOST = 0.5;
+const MARKER_HOVER_LERP = 0.2;
+
 /** Initialize the orb on `canvas`, drive the `tooltipEl` on hover.
  *  Returns a cleanup function — call it on unmount. */
 export async function initOrb(
@@ -165,20 +171,60 @@ export async function initOrb(
     markerPositions[3 * m + 1] = md.y * MARKER_R;
     markerPositions[3 * m + 2] = md.z * MARKER_R;
   }
+  /* Per-marker hover progress (0 = idle, 1 = hovered). Lerped in tick() and
+     written back to the buffer attribute; the marker shader reads it to
+     scale size and brightness. */
+  const markerHoverProgress = new Float32Array(NM);
   const markerGeom = new THREE.BufferGeometry();
   markerGeom.setAttribute(
     "position",
     new THREE.BufferAttribute(markerPositions, 3),
   );
+  markerGeom.setAttribute(
+    "aHover",
+    new THREE.BufferAttribute(markerHoverProgress, 1),
+  );
   const markerTex = makeCircleTexture();
-  const markerMat = new THREE.PointsMaterial({
-    map: markerTex,
-    size: MARKER_SIZE,
-    color: 0xffd040,
+  const markerMat = new THREE.ShaderMaterial({
+    uniforms: {
+      uMap: { value: markerTex },
+      uSize: { value: MARKER_SIZE },
+      uPixelRatio: { value: Math.min(window.devicePixelRatio, 2) },
+      uHoverSizeBoost: { value: MARKER_HOVER_SIZE_BOOST },
+      uHoverBrightBoost: { value: MARKER_HOVER_BRIGHT_BOOST },
+      uColor: { value: new THREE.Color(0xffd040) },
+    },
+    vertexShader: /* glsl */ `
+      attribute float aHover;
+      varying float vHover;
+
+      uniform float uSize;
+      uniform float uPixelRatio;
+      uniform float uHoverSizeBoost;
+
+      void main() {
+        vHover = aHover;
+        vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+        gl_Position = projectionMatrix * mvPosition;
+        float sizeMul = 1.0 + aHover * uHoverSizeBoost;
+        gl_PointSize = uSize * sizeMul * uPixelRatio * (300.0 / -mvPosition.z);
+      }
+    `,
+    fragmentShader: /* glsl */ `
+      varying float vHover;
+      uniform sampler2D uMap;
+      uniform vec3 uColor;
+      uniform float uHoverBrightBoost;
+
+      void main() {
+        vec4 tex = texture2D(uMap, gl_PointCoord);
+        if (tex.a < 0.05) discard;
+        float brightness = 1.0 + vHover * uHoverBrightBoost;
+        gl_FragColor = vec4(uColor * brightness, tex.a);
+      }
+    `,
     transparent: true,
-    opacity: 1.0,
     depthWrite: false,
-    sizeAttenuation: true,
   });
   const markerPoints = new THREE.Points(markerGeom, markerMat);
 
@@ -241,6 +287,10 @@ export async function initOrb(
   const tmpToCam = new THREE.Vector3();
   const tmpNormal = new THREE.Vector3();
 
+  /* Index of the currently hovered marker (-1 = none). Drives the per-marker
+     animation in tick(). */
+  let hoveredMarkerIdx = -1;
+
   function setTooltipVisible(visible: boolean) {
     tooltipEl.style.opacity = visible ? "1" : "0";
   }
@@ -248,6 +298,7 @@ export async function initOrb(
   function updateHover(clientX: number, clientY: number) {
     if (isDragging) {
       setTooltipVisible(false);
+      hoveredMarkerIdx = -1;
       return;
     }
     const rect = canvas.getBoundingClientRect();
@@ -267,6 +318,7 @@ export async function initOrb(
       tmpNormal.copy(tmpWorld).normalize();
       tmpToCam.subVectors(camera.position, tmpWorld).normalize();
       if (tmpNormal.dot(tmpToCam) > 0.1) {
+        hoveredMarkerIdx = idx;
         tooltipEl.textContent = MARKER_LOCATIONS[idx][2] ?? "";
         tooltipEl.style.left = `${clientX}px`;
         tooltipEl.style.top = `${clientY}px`;
@@ -274,12 +326,16 @@ export async function initOrb(
         return;
       }
     }
+    hoveredMarkerIdx = -1;
     setTooltipVisible(false);
   }
 
   const onHoverPointerMove = (e: PointerEvent) =>
     updateHover(e.clientX, e.clientY);
-  const onPointerLeave = () => setTooltipVisible(false);
+  const onPointerLeave = () => {
+    setTooltipVisible(false);
+    hoveredMarkerIdx = -1;
+  };
   canvas.addEventListener("pointermove", onHoverPointerMove);
   canvas.addEventListener("pointerleave", onPointerLeave);
 
@@ -296,6 +352,25 @@ export async function initOrb(
     const t = performance.now() / 1000;
     dotsMat.uniforms.uBreath.value =
       1.0 + Math.sin(t * breathOmega) * BREATH_AMPLITUDE;
+
+    /* Lerp each marker's hover progress toward target — the hovered one
+       eases toward 1, all others toward 0. Cross-fades cleanly when the
+       cursor moves between pins. */
+    let hoverDirty = false;
+    for (let i = 0; i < NM; i++) {
+      const target = i === hoveredMarkerIdx && !isDragging ? 1.0 : 0.0;
+      const curr = markerHoverProgress[i];
+      const next = curr + (target - curr) * MARKER_HOVER_LERP;
+      if (Math.abs(next - curr) > 0.0001) {
+        markerHoverProgress[i] = next;
+        hoverDirty = true;
+      }
+    }
+    if (hoverDirty) {
+      (markerGeom.attributes.aHover as THREE.BufferAttribute).needsUpdate =
+        true;
+    }
+
     renderer.render(scene, camera);
   }
 
